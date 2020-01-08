@@ -1,3 +1,6 @@
+## 1.3.0
+  - Added SNMP trap listener support
+
 ## 1.2.1
   - Fixed GAUGE32 integer overflow [#65] (https://github.com/logstash-plugins/logstash-input-snmp/pull/65)
 

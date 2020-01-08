@@ -5,6 +5,7 @@ require "stud/interval"
 require "socket" # for Socket.gethostname
 require_relative "snmp/client"
 require_relative "snmp/clientv3"
+require_relative "snmp/listener"
 require_relative "snmp/mib"
 
 # Generate a repeating message.
@@ -22,6 +23,9 @@ class LogStash::Inputs::Snmp < LogStash::Inputs::Base
 
   # List of tables to walk
   config :tables, :validate => :array  #[ {"name" => "interfaces" "columns" => ["1.3.6.1.2.1.2.2.1.1", "1.3.6.1.2.1.2.2.1.2", "1.3.6.1.2.1.2.2.1.5"]} ]
+
+  # Configuration options for starting a trap listener
+  config :listen, :validate => :hash   # {host => "udp:192.168.1.5/1161" community => "public" threads => 20}
 
   # List of hosts to query the configured `get` and `walk` options.
   #
@@ -98,9 +102,14 @@ class LogStash::Inputs::Snmp < LogStash::Inputs::Base
   PROVIDED_MIB_PATHS = [::File.join(BASE_MIB_PATH, "logstash"), ::File.join(BASE_MIB_PATH, "ietf")].map { |path| ::File.expand_path(path) }
 
   def register
-    validate_oids!
-    validate_hosts!
-    validate_tables!
+    
+    if !listen.nil?
+      validate_listen!
+    else
+      validate_oids!
+      validate_hosts!
+      validate_tables!
+    end
     validate_strip!
 
     mib = LogStash::SnmpMib.new
@@ -118,97 +127,124 @@ class LogStash::Inputs::Snmp < LogStash::Inputs::Base
     end
 
     # setup client definitions per provided host
-
     @client_definitions = []
-    @hosts.each do |host|
-      host_name = host["host"]
-      community = host["community"] || "public"
-      version = host["version"] || "2c"
-      raise(LogStash::ConfigurationError, "only protocol version '1', '2c' and '3' are supported for host option '#{host_name}'") unless version =~ VERSION_REGEX
-
-      retries = host["retries"] || 2
-      timeout = host["timeout"] || 1000
-
-      # TODO: move these validations in a custom validator so it happens before the register method is called.
+    if listen.nil? 
+      @hosts.each do |host|
+        host_name = host["host"]
+        community = host["community"] || "public"
+        version = host["version"] || "2c"
+        raise(LogStash::ConfigurationError, "only protocol version '1', '2c' and '3' are supported for host option '#{host_name}'") unless version =~ VERSION_REGEX
+  
+        retries = host["retries"] || 2
+        timeout = host["timeout"] || 1000
+  
+        # TODO: move these validations in a custom validator so it happens before the register method is called.
+        host_details = host_name.match(HOST_REGEX)
+        raise(LogStash::ConfigurationError, "invalid format for host option '#{host_name}'") unless host_details
+        raise(LogStash::ConfigurationError, "only udp & tcp protocols are supported for host option '#{host_name}'") unless host_details[:host_protocol].to_s =~ /^(?:udp|tcp)$/i
+  
+        protocol = host_details[:host_protocol]
+        address = host_details[:host_address]
+        port = host_details[:host_port]
+  
+        definition = {
+          :get => Array(get),
+          :walk => Array(walk),
+  
+          :host_protocol => protocol,
+          :host_address => address,
+          :host_port => port,
+          :host_community => community,
+        }
+  
+        if version == "3"
+          validate_v3_user! # don't really care if verified for every host
+          auth_pass = @auth_pass.nil? ? nil : @auth_pass.value
+          priv_pass = @priv_pass.nil? ? nil : @priv_pass.value
+          definition[:client] = LogStash::SnmpClientV3.new(protocol, address, port, retries, timeout, mib, @security_name, @auth_protocol, auth_pass, @priv_protocol, priv_pass, @security_level)
+        else
+          definition[:client] = LogStash::SnmpClient.new(protocol, address, port, community, version, retries, timeout, mib)
+        end
+        @client_definitions << definition
+      end
+    else
+      host_name = listen["host"]
+      
       host_details = host_name.match(HOST_REGEX)
       raise(LogStash::ConfigurationError, "invalid format for host option '#{host_name}'") unless host_details
       raise(LogStash::ConfigurationError, "only udp & tcp protocols are supported for host option '#{host_name}'") unless host_details[:host_protocol].to_s =~ /^(?:udp|tcp)$/i
 
-      protocol = host_details[:host_protocol]
-      address = host_details[:host_address]
-      port = host_details[:host_port]
-
       definition = {
-        :get => Array(get),
-        :walk => Array(walk),
-
-        :host_protocol => protocol,
-        :host_address => address,
-        :host_port => port,
-        :host_community => community,
+        :protocol => host_details[:host_protocol] || "udp",
+        :address => host_details[:host_address] || "0.0.0.0",
+        :port => host_details[:host_port] || 161,
+        :community => listen["community"] || "public",
+        :threads => listen["threads"] || 10,
+        :mib => mib,
       }
-
-      if version == "3"
-        validate_v3_user! # don't really care if verified for every host
-        auth_pass = @auth_pass.nil? ? nil : @auth_pass.value
-        priv_pass = @priv_pass.nil? ? nil : @priv_pass.value
-        definition[:client] = LogStash::SnmpClientV3.new(protocol, address, port, retries, timeout, mib, @security_name, @auth_protocol, auth_pass, @priv_protocol, priv_pass, @security_level)
-      else
-        definition[:client] = LogStash::SnmpClient.new(protocol, address, port, community, version, retries, timeout, mib)
-      end
       @client_definitions << definition
     end
   end
 
   def run(queue)
-    # for now a naive single threaded poller which sleeps for the given interval between
-    # each run. each run polls all the defined hosts for the get and walk options.
-    while !stop?
-      @client_definitions.each do |definition|
-        result = {}
-        if !definition[:get].empty?
-          begin
-            result = result.merge(definition[:client].get(definition[:get], @oid_root_skip, @oid_path_length))
-          rescue => e
-            logger.error("error invoking get operation on #{definition[:host_address]} for OIDs: #{definition[:get]}, ignoring", :exception => e, :backtrace => e.backtrace)
-          end
-        end
-        if  !definition[:walk].empty?
-          definition[:walk].each do |oid|
-            begin
-              result = result.merge(definition[:client].walk(oid, @oid_root_skip, @oid_path_length))
-            rescue => e
-              logger.error("error invoking walk operation on OID: #{oid}, ignoring", :exception => e, :backtrace => e.backtrace)
+    @queue = queue
+    if listen.nil?
+      # for now a naive single threaded poller which sleeps for the given interval between
+      # each run. each run polls all the defined hosts for the get and walk options.
+      while !stop?
+        if !listen.nil?
+          @client_definitions.each do |definition|
+            result = {}
+            if !definition[:get].empty?
+              begin
+                result = result.merge(definition[:client].get(definition[:get], @oid_root_skip, @oid_path_length))
+              rescue => e
+                logger.error("error invoking get operation on #{definition[:host_address]} for OIDs: #{definition[:get]}, ignoring", :exception => e, :backtrace => e.backtrace)
+              end
+            end
+            if  !definition[:walk].empty?
+              definition[:walk].each do |oid|
+                begin
+                  result = result.merge(definition[:client].walk(oid, @oid_root_skip, @oid_path_length))
+                rescue => e
+                  logger.error("error invoking walk operation on OID: #{oid}, ignoring", :exception => e, :backtrace => e.backtrace)
+                end
+              end
+            end
+    
+            if  !Array(@tables).empty?
+              @tables.each do |table_entry|
+                begin
+                  result = result.merge(definition[:client].table(table_entry, @oid_root_skip, @oid_path_length))
+                rescue => e
+                  logger.error("error invoking table operation on OID: #{table_entry['name']}, ignoring", :exception => e, :backtrace => e.backtrace)
+                end
+              end
+            end
+    
+            unless result.empty?
+              metadata = {
+                "host_protocol" => definition[:host_protocol],
+                "host_address" => definition[:host_address],
+                "host_port" => definition[:host_port],
+                "host_community" => definition[:host_community],
+              }
+              result["@metadata"] = metadata
+    
+              event = LogStash::Event.new(result)
+              decorate(event)
+              queue << event
             end
           end
-        end
-
-        if  !Array(@tables).empty?
-          @tables.each do |table_entry|
-            begin
-              result = result.merge(definition[:client].table(table_entry, @oid_root_skip, @oid_path_length))
-            rescue => e
-              logger.error("error invoking table operation on OID: #{table_entry['name']}, ignoring", :exception => e, :backtrace => e.backtrace)
-            end
-          end
-        end
-
-        unless result.empty?
-          metadata = {
-            "host_protocol" => definition[:host_protocol],
-            "host_address" => definition[:host_address],
-            "host_port" => definition[:host_port],
-            "host_community" => definition[:host_community],
-          }
-          result["@metadata"] = metadata
-
-          event = LogStash::Event.new(result)
-          decorate(event)
-          queue << event
+    
+          Stud.stoppable_sleep(@interval) { stop? }
         end
       end
-
-      Stud.stoppable_sleep(@interval) { stop? }
+    else
+      logger.info("Queue in SNMP is '#{queue}'")
+      @client_definitions.each do |definition|
+        @listener = Logstash::SnmpListener.new(definition[:protocol], definition[:address], definition[:port], definition[:community], definition[:mib], definition[:threads], @oid_root_skip, @oid_path_length, @queue)
+      end
     end
   end
 
@@ -266,6 +302,12 @@ class LogStash::Inputs::Snmp < LogStash::Inputs::Base
     raise(LogStash::ConfigurationError, errors.join(", ")) unless errors.empty?
    end
 
+  def validate_listen!
+    if !listen.nil?
+      raise(LogStash::ConfigurationError, "you can not specify listen in the same input as get, walk or table") if !@get.nil? || !@walk.nil? || !@tables.nil?
+      raise(LogStash::ConfigurationError, "you can not specify listen in the same input as get, walk or table") if !listen.is_a?(Hash) || listen["host"].nil?
+    end
+  end
 
   def validate_hosts!
     # TODO: for new we only validate the host part, not the other optional options
